@@ -1,8 +1,9 @@
+import io
 import os
 import pickle
+import re
 import numpy as np
 import streamlit as st
-from Orange.data import Table
 
 # ---------------------------------------------------------
 # 1. 페이지 기본 설정
@@ -17,47 +18,92 @@ MODEL_PATH = "traffic_casualty_model.pkcls"
 
 
 # ---------------------------------------------------------
-# 2. Orange3 모델 로드 함수
+# 2. Orange3 설치 없이 .pkcls 내부 MLP 모델 및 전처리 추출
 # ---------------------------------------------------------
+class _DummyObj:
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.__dict__.update(state)
+        else:
+            self._state = state
+
+
+class _OrangeFreeUnpickler(pickle.Unpickler):
+    """Orange3 패키지가 없는 Linux 클라우드 환경에서도 .pkcls를 열기 위한 언피클러"""
+
+    def find_class(self, module, name):
+        if module.startswith("Orange") or module.startswith("numpy.random"):
+            return type(name, (_DummyObj,), {"__module__": module})
+        return super().find_class(module, name)
+
+
 @st.cache_resource
-def load_orange_model(model_path: str):
+def load_model_bundle(model_path: str):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
+
     with open(model_path, "rb") as f:
-        model = pickle.load(f)
-    return model
+        raw_bytes = f.read()
+
+    orange_wrapper = _OrangeFreeUnpickler(io.BytesIO(raw_bytes)).load()
+    skl_model = orange_wrapper.skl_model
+
+    # 도메인에서 시도 카테고리 목록과 각 변수의 정규화(offset, factor) 계수 추출
+    sido_values = ("경기", "부산", "서울")
+    for attr in orange_wrapper.original_domain.attributes:
+        if getattr(attr, "_name", "") == "시도" and len(attr._args) >= 4:
+            sido_values = tuple(attr._args[3])
+
+    norm_params = {}
+    for attr in orange_wrapper.domain.attributes:
+        name = getattr(attr, "_name", "")
+        cv = getattr(attr, "_compute_value", None)
+        if cv is not None and hasattr(cv, "offset") and hasattr(cv, "factor"):
+            norm_params[name] = (float(cv.offset), float(cv.factor))
+
+    return {
+        "skl_model": skl_model,
+        "sido_values": list(sido_values),
+        "norm_params": norm_params,
+    }
 
 
 def predict_casualties(
-    model,
+    bundle: dict,
     sido: str,
     accidents: float,
     serious_injuries: float,
     minor_injuries: float,
     reported_injuries: float,
 ) -> float:
-    """Orange3 원본 도메인에 맞춰 입력 Table을 생성하고 예측값을 반환합니다."""
-    domain = model.original_domain
-    feature_values = {
-        "시도": sido,
-        "사고건수": float(accidents),
-        "중상자수": float(serious_injuries),
-        "경상자수": float(minor_injuries),
-        "부상신고자수": float(reported_injuries),
-    }
+    """Orange3 전처리 파이프라인(원-핫 인코딩 + 표준화)을 동일하게 적용해 예측합니다."""
+    norm = bundle["norm_params"]
 
-    row = []
-    for attr in domain.attributes:
-        val = feature_values.get(attr.name, np.nan)
-        if attr.is_discrete:
-            row.append(attr.to_val(val) if val in attr.values else np.nan)
-        else:
-            row.append(float(val))
+    def scale(key: str, raw_val: float) -> float:
+        offset, factor = norm[key]
+        return (raw_val - offset) * factor
 
-    input_table = Table.from_list(domain, [row])
-    prediction = model(input_table)
-    predicted_value = float(prediction[0])
-    return max(0.0, predicted_value)
+    # Orange3 Neural Network 전처리 피처 순서:
+    # [시도=경기, 시도=부산, 시도=서울, 사고건수, 중상자수, 경상자수, 부상신고자수]
+    x_vec = np.array(
+        [[
+            scale("시도=경기", 1.0 if sido == "경기" else 0.0),
+            scale("시도=부산", 1.0 if sido == "부산" else 0.0),
+            scale("시도=서울", 1.0 if sido == "서울" else 0.0),
+            scale("사고건수", float(accidents)),
+            scale("중상자수", float(serious_injuries)),
+            scale("경상자수", float(minor_injuries)),
+            scale("부상신고자수", float(reported_injuries)),
+        ]],
+        dtype=np.float64,
+    )
+
+    pred = float(bundle["skl_model"].predict(x_vec)[0])
+    return max(0.0, pred)
 
 
 # ---------------------------------------------------------
@@ -91,7 +137,7 @@ def get_safety_status(predicted_deaths: float):
                 "스쿨존 내 **시속 20~30km 이하 서행** 및 전방 주시를 대폭 강화하세요.",
                 "신호등 없는 횡단보도 앞에서는 **무조건 일시정지**하여 보행자 횡단 여부를 확인하세요.",
                 "우회전 시 사각지대에 키가 작은 어린이가 있는지 반사경과 육안으로 재확인하세요.",
-                " 불법 주·정차 차량 사이에서 어린이가 튀어나올 수 있으니 브레이크에 발을 올리고 주행하세요.",
+                "불법 주·정차 차량 사이에서 어린이가 튀어나올 수 있으니 브레이크에 발을 올리고 주행하세요.",
             ],
         }
     else:
@@ -156,7 +202,7 @@ st.title("🚦 교통사고 예상 사망자 수 예측 및 스쿨존 안전 대
 st.caption("Orange3 신경망(MLP) 회귀 모델(`traffic_casualty_model.pkcls`) 기반 실시간 시뮬레이터")
 
 try:
-    model = load_orange_model(MODEL_PATH)
+    bundle = load_model_bundle(MODEL_PATH)
 except Exception as e:
     st.error(f"모델을 불러오는 중 오류가 발생했습니다: {e}")
     st.info("GitHub 저장소 루트 경로에 `traffic_casualty_model.pkcls` 파일이 함께 업로드되어 있는지 확인해 주세요.")
@@ -164,15 +210,12 @@ except Exception as e:
 
 st.divider()
 
-# 좌측: 입력 컨트롤 / 우측: 예측 결과 + 대형 신호등 + 안전 수칙 카드
 left_col, right_col = st.columns([1.05, 1.35], gap="large")
 
 with left_col:
     st.subheader("1️⃣ 지역 및 사고 조건 설정")
 
-    # 모델 도메인에서 시도 목록 추출 (기본값: ['경기', '부산', '서울'])
-    sido_attr = model.original_domain["시도"]
-    sido_options = list(sido_attr.values) if sido_attr.is_discrete else ["서울", "경기", "부산"]
+    sido_options = bundle["sido_values"]
     default_sido_idx = sido_options.index("서울") if "서울" in sido_options else 0
 
     selected_sido = st.selectbox(
@@ -219,7 +262,7 @@ with left_col:
 
 # 실시간 모델 예측 실행
 predicted_deaths = predict_casualties(
-    model=model,
+    bundle=bundle,
     sido=selected_sido,
     accidents=accidents,
     serious_injuries=serious_injuries,
@@ -266,12 +309,9 @@ with right_col:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # 어린이 보호구역 안전 수칙 카드
     rules_html = "".join(
         [f"<li style='margin-bottom:8px; line-height:1.55;'>{rule}</li>" for rule in status["rules"]]
     )
-    # 마크다운 볼드(**text**)를 HTML <strong>으로 변환
-    import re
     rules_html = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", rules_html)
 
     st.markdown(
